@@ -19,7 +19,12 @@ import io
 import subprocess
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi.responses import (
+    StreamingResponse,
+    JSONResponse,
+    HTMLResponse,
+    FileResponse,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -942,6 +947,7 @@ async def health_check():
 async def upload_voice(
     file: UploadFile = File(...),
     voice_name: str = Form(...),
+    voice_id: Optional[str] = Form(None),
 ):
     """Upload a new voice file (WAV or MP3) - converts to WAV format"""
     try:
@@ -965,7 +971,15 @@ async def upload_voice(
             raise HTTPException(status_code=400, detail="Invalid voice name")
 
         # Save file
-        voice_id = safe_name.lower().replace(" ", "-")
+        if voice_id:
+            voice_id = "".join(
+                c for c in voice_id if c.isalnum() or c in "-_ "
+            ).strip()
+            if not voice_id:
+                raise HTTPException(status_code=400, detail="Invalid voice ID")
+        else:
+            voice_id = safe_name
+        voice_id = voice_id.lower().replace(" ", "-").replace("_", "-")
 
         # Always save as WAV for consistency
         target_path = voices_dir / f"{voice_id}.wav"
@@ -1029,6 +1043,7 @@ async def upload_voice(
             "preview": f"/voices/{voice_id}/preview",
             "type": "custom",
         }
+        voice_states.pop(voice_id, None)
 
         return {
             "status": "success",
@@ -1045,6 +1060,49 @@ async def upload_voice(
 
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to upload voice: {str(e)}")
+
+
+@app.get("/api/voices/{voice_id}/file")
+async def download_voice_file(voice_id: str):
+    """Download the WAV file for an uploaded voice."""
+    voice = available_voices.get(voice_id)
+    if not voice:
+        raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found")
+
+    voice_path = Path(voice["file"])
+    if not voice_path.is_file():
+        available_voices.pop(voice_id, None)
+        voice_states.pop(voice_id, None)
+        raise HTTPException(status_code=404, detail=f"Voice file '{voice_id}' not found")
+
+    return FileResponse(
+        str(voice_path),
+        media_type="audio/wav",
+        filename=f"{voice_id}.wav",
+    )
+
+
+@app.delete("/api/voices/{voice_id}")
+async def delete_voice(voice_id: str):
+    """Delete an uploaded voice and invalidate its cached state."""
+    voice = available_voices.get(voice_id)
+    if not voice:
+        raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found")
+
+    voice_path = Path(voice["file"])
+    try:
+        voice_path.unlink(missing_ok=True)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete voice: {e}")
+
+    available_voices.pop(voice_id, None)
+    voice_states.pop(voice_id, None)
+
+    return {
+        "status": "success",
+        "voice_id": voice_id,
+        "message": f"Voice '{voice_id}' deleted",
+    }
 
 
 # ============== Static Files ==============
